@@ -1,5 +1,8 @@
 # nix-reaper
 
+# Horrible cli made by ai
+# only because im to lazy
+
 A small CLI that does everything `nix-collect-garbage -d` / `nix store optimise`
 don't: trims old generations (system, user, home-manager), runs the real GC,
 finds stray `result` symlinks and nix-direnv dev-shell profiles that pin whole
