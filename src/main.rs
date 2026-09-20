@@ -1,9 +1,20 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::SystemTime;
+
+// ---------- tiny ANSI helpers (no extra crate needed) ----------
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
 
 #[derive(Parser)]
 #[command(
@@ -20,15 +31,15 @@ struct Cli {
 enum Cmd {
     /// Report what's currently taking up space. Read-only, changes nothing.
     Status,
-    /// Clean things up. Prints a plan by default; pass --yes to actually run it.
+    /// Clean things up. Runs for real by default; pass --dry-run to preview instead.
     Clean(CleanArgs),
 }
 
 #[derive(Args)]
 struct CleanArgs {
-    /// Actually execute the plan. Without this flag, nix-reaper only prints what it would do.
-    #[arg(short, long)]
-    yes: bool,
+    /// Preview the plan without changing anything. Without this flag, nix-reaper runs for real.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
 
     /// Keep this many NixOS system profile generations
     #[arg(long, default_value_t = 3)]
@@ -62,7 +73,7 @@ struct CleanArgs {
     #[arg(long)]
     roots: bool,
 
-    /// Only remove root symlinks older than this many days (used with --roots --yes)
+    /// Only remove root symlinks older than this many days (used with --roots)
     #[arg(long, default_value_t = 30)]
     roots_older_than_days: u64,
 
@@ -141,7 +152,7 @@ fn status() -> Result<()> {
         for r in &roots {
             println!("  {} ({})", r.display(), describe_age(r));
         }
-        println!("  -> `nix-reaper clean --roots --yes` removes the stale ones");
+        println!("  -> `nix-reaper clean --roots` removes the stale ones");
     }
 
     section("Non-Nix disk hogs");
@@ -164,7 +175,7 @@ fn status() -> Result<()> {
     }
 
     println!();
-    println!("Run `nix-reaper clean --all` to see a cleanup plan (dry-run), then add --yes to execute it.");
+    println!("Run `nix-reaper clean --all` to actually clean everything (add --dry-run first if you want to preview it).");
     Ok(())
 }
 
@@ -182,10 +193,10 @@ fn clean(mut args: CleanArgs) -> Result<()> {
     }
 
     let home = dirs_home()?;
-    let dry_run = !args.yes;
+    let dry_run = args.dry_run;
 
     if dry_run {
-        println!("DRY RUN — nothing will actually change. Re-run with --yes once this plan looks right.\n");
+        println!("{DIM}DRY RUN — nothing will actually change. Drop --dry-run to run this for real.{RESET}\n");
     }
 
     let before_size = run_captured("du", &["-sh", "/nix/store"]);
@@ -208,7 +219,10 @@ fn clean(mut args: CleanArgs) -> Result<()> {
 
     // 2. your own user profile generations
     let keep_user_flag = format!("+{}", args.keep_user);
-    let why_user = format!("keep the {} newest generations of your own user profile", args.keep_user);
+    let why_user = format!(
+        "keep the {} newest generations of your own user profile",
+        args.keep_user
+    );
     step(
         dry_run,
         false,
@@ -220,15 +234,23 @@ fn clean(mut args: CleanArgs) -> Result<()> {
     // 3. home-manager generations, if present
     if command_exists("home-manager") {
         let hm_flag = format!("-{} days", args.keep_home_days);
-        let why_hm = format!("expire home-manager generations older than {} days", args.keep_home_days);
-        step(dry_run, false, "home-manager", &["expire-generations", hm_flag.as_str()], &why_hm);
-    }
-
-    // 4. actual gc
-    if args.gc {
+        let why_hm = format!(
+            "expire home-manager generations older than {} days",
+            args.keep_home_days
+        );
         step(
             dry_run,
             false,
+            "home-manager",
+            &["expire-generations", hm_flag.as_str()],
+            &why_hm,
+        );
+    }
+
+    // 4. actual gc — this is the noisy one, so it gets the quiet streaming path
+    if args.gc {
+        gc_step(
+            dry_run,
             "nix-collect-garbage",
             &["-d"],
             "delete everything no longer reachable from a live generation (add sudo yourself if this errors on permissions)",
@@ -283,11 +305,11 @@ fn clean(mut args: CleanArgs) -> Result<()> {
     if !dry_run {
         if let Some(before) = before_size {
             if let Some(after) = run_captured("du", &["-sh", "/nix/store"]) {
-                println!("\nnix store size: {before} -> {after}");
+                println!("\n{BOLD}nix store size:{RESET} {before} -> {GREEN}{after}{RESET}");
             }
         }
     } else {
-        println!("\nLooks right? Re-run the same command with --yes to actually do it.");
+        println!("\n{DIM}Looks right? Re-run the same command without --dry-run to actually do it.{RESET}");
     }
 
     Ok(())
@@ -330,7 +352,7 @@ fn find_home_roots(home: &Path) -> Vec<PathBuf> {
 fn clean_roots(home: &Path, dry_run: bool, cutoff_days: u64) {
     let roots = find_home_roots(home);
     if roots.is_empty() {
-        println!("[roots] none found under {}", home.display());
+        println!("{DIM}[roots] none found under {}{RESET}", home.display());
         return;
     }
     for r in &roots {
@@ -347,7 +369,7 @@ fn clean_roots(home: &Path, dry_run: bool, cutoff_days: u64) {
 
         if dry_run {
             println!(
-                "[dry-run] rm {}   ({age_days}d old — project directory stays, only the pinning symlink goes)",
+                "{DIM}[dry-run] rm {}   ({age_days}d old — project directory stays, only the pinning symlink goes){RESET}",
                 r.display()
             );
             continue;
@@ -355,11 +377,14 @@ fn clean_roots(home: &Path, dry_run: bool, cutoff_days: u64) {
 
         match fs::symlink_metadata(r) {
             Ok(meta) if meta.file_type().is_symlink() => match fs::remove_file(r) {
-                Ok(_) => println!("removed {}", r.display()),
-                Err(e) => println!("could not remove {}: {e}", r.display()),
+                Ok(_) => println!("{GREEN}removed{RESET} {}", r.display()),
+                Err(e) => println!("{RED}could not remove{RESET} {}: {e}", r.display()),
             },
-            Ok(_) => println!("skipping {} (not a symlink, leaving it alone)", r.display()),
-            Err(_) => println!("skipping {} (already gone)", r.display()),
+            Ok(_) => println!(
+                "{YELLOW}skipping{RESET} {} (not a symlink, leaving it alone)",
+                r.display()
+            ),
+            Err(_) => println!("{DIM}skipping {} (already gone){RESET}", r.display()),
         }
     }
 }
@@ -376,21 +401,101 @@ fn step(dry_run: bool, sudo: bool, program: &str, args: &[&str], why: &str) {
     let rendered = parts.join(" ");
 
     if dry_run {
-        println!("[dry-run] {rendered}");
-        println!("          ({why})");
+        println!("{DIM}[dry-run] {rendered}{RESET}");
+        println!("{DIM}          ({why}){RESET}");
         return;
     }
 
-    println!("-> {rendered}   ({why})");
+    println!("{GREEN}{BOLD}->{RESET} {BOLD}{rendered}{RESET}  {DIM}({why}){RESET}");
     let status = if sudo {
         Command::new("sudo").arg(program).args(args).status()
     } else {
         Command::new(program).args(args).status()
     };
     match status {
-        Ok(s) if s.success() => println!("   ok"),
-        Ok(s) => println!("   exited with {s}"),
-        Err(e) => println!("   failed to run: {e}"),
+        Ok(s) if s.success() => println!("   {GREEN}ok{RESET}"),
+        Ok(s) => println!("   {YELLOW}exited with {s}{RESET}"),
+        Err(e) => println!("   {RED}failed to run: {e}{RESET}"),
+    }
+}
+
+/// Like `step`, but for commands (namely `nix-collect-garbage -d`) that dump one
+/// `deleting '/nix/store/...'` line per path. Instead of letting that flood the
+/// terminal, we count them and show a single updating counter, still printing
+/// anything else (the hardlink-savings note, the final summary line) normally.
+fn gc_step(dry_run: bool, program: &str, args: &[&str], why: &str) {
+    let rendered = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if dry_run {
+        println!("{DIM}[dry-run] {rendered}{RESET}");
+        println!("{DIM}          ({why}){RESET}");
+        return;
+    }
+
+    println!("{GREEN}{BOLD}->{RESET} {BOLD}{rendered}{RESET}  {DIM}({why}){RESET}");
+
+    let child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            println!("   {RED}failed to run: {e}{RESET}");
+            return;
+        }
+    };
+
+    let stderr = child.stderr.take();
+    let stderr_handle = stderr.map(|s| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(s).lines().map_while(std::result::Result::ok) {
+                println!("   {YELLOW}{line}{RESET}");
+            }
+        })
+    });
+
+    if let Some(stdout) = child.stdout.take() {
+        let mut deleted_count: u64 = 0;
+        let mut counter_on_screen = false;
+
+        for line in BufReader::new(stdout)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if line.starts_with("deleting '") {
+                deleted_count += 1;
+                print!("\r   {DIM}deleting store paths… {deleted_count}{RESET}");
+                let _ = std::io::stdout().flush();
+                counter_on_screen = true;
+                continue;
+            }
+            if counter_on_screen {
+                println!();
+                counter_on_screen = false;
+            }
+            if !line.trim().is_empty() {
+                println!("   {line}");
+            }
+        }
+        if counter_on_screen {
+            println!();
+        }
+    }
+
+    if let Some(h) = stderr_handle {
+        let _ = h.join();
+    }
+
+    match child.wait() {
+        Ok(s) if s.success() => println!("   {GREEN}ok{RESET}"),
+        Ok(s) => println!("   {YELLOW}exited with {s}{RESET}"),
+        Err(e) => println!("   {RED}failed to wait on child: {e}{RESET}"),
     }
 }
 
@@ -420,11 +525,14 @@ fn dirs_home() -> Result<PathBuf> {
 }
 
 fn section(title: &str) {
-    println!("\n== {title} ==");
+    println!("\n{BOLD}{CYAN}== {title} =={RESET}");
 }
 
 fn indent(s: &str) -> String {
-    s.lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_generation_count(label: &str, profile: &str) {
