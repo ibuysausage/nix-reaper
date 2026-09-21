@@ -12,7 +12,9 @@ use std::time::SystemTime;
 #[command(
     name = "nix-reaper",
     version,
-    about = "Deep-clean a NixOS system: generations, boot entries, GC roots, and non-Nix bloat that plain `nix-collect-garbage` never touches."
+    about = "Deep-clean a NixOS system: generations, boot entries, GC roots, non-Nix bloat, \
+             dev-tool caches, coredumps — ALL of it. `clean` keeps nothing old around. \
+             There is no --keep-last-N. If it's not your current generation, it's gone."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,8 +25,10 @@ struct Cli {
 enum Cmd {
     /// Report what's currently taking up space. Read-only, changes nothing.
     Status,
-    /// Deep-clean everything: generations, gc, store optimise, journal, docker/podman,
-    /// and stray gcroots. Runs for real by default — pass --dry-run to preview instead.
+    /// NUKE everything: all old generations (system + user + home-manager), every stray
+    /// GC root regardless of age, the journal, docker/podman (images, containers, volumes,
+    /// build cache), coredumps, trash, and common dev-tool caches (cargo/npm/go). Runs for
+    /// real by default — pass --dry-run to preview instead.
     Clean(CleanArgs),
 }
 
@@ -34,28 +38,13 @@ struct CleanArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Keep this many NixOS system profile generations
-    #[arg(long, default_value_t = 3)]
-    keep_system: u32,
-
-    /// Keep this many per-user (nix-env) profile generations
-    #[arg(long, default_value_t = 3)]
-    keep_user: u32,
-
-    /// Expire home-manager generations older than this many days (skipped if home-manager isn't found)
-    #[arg(long, default_value_t = 30)]
-    keep_home_days: u32,
-
-    /// Vacuum the systemd journal down to this size, e.g. 200M. Pass "off" to skip journal cleanup.
-    #[arg(long, value_name = "SIZE", default_value = "200M")]
+    /// journalctl --vacuum-time value. Keeps only logs younger than this. Default nukes
+    /// nearly the whole journal. Pass "off" to skip journal cleanup entirely.
+    #[arg(long, value_name = "TIME", default_value = "1s")]
     journal: String,
 
-    /// Only remove root symlinks older than this many days
-    #[arg(long, default_value_t = 30)]
-    roots_older_than_days: u64,
-
-    /// No longer needed — `clean` already does everything --all used to. Kept as a harmless no-op
-    /// so old scripts/aliases that still pass it don't break.
+    /// No longer needed — `clean` already nukes everything --all used to and then some.
+    /// Kept as a harmless no-op so old scripts/aliases that still pass it don't break.
     #[arg(long, hide = true)]
     all: bool,
 }
@@ -81,7 +70,7 @@ fn status() -> Result<()> {
         println!("{}", indent(&out));
     }
 
-    section("Generations");
+    section("Generations (clean deletes ALL of these except the current one)");
     print_generation_count("system profile", "/nix/var/nix/profiles/system");
     let user_profile = format!("{}/.nix-profile", home.display());
     print_generation_count("your user profile", &user_profile);
@@ -94,7 +83,7 @@ fn status() -> Result<()> {
         println!("  home-manager: not installed, skipping");
     }
 
-    section("Boot entries");
+    section("Boot entries (clean does NOT touch these — see note below)");
     match fs::read_dir("/boot/loader/entries") {
         Ok(entries) => {
             let n = entries.filter_map(|e| e.ok()).count();
@@ -106,6 +95,12 @@ fn status() -> Result<()> {
             println!("  set `boot.loader.grub.configurationLimit = 5;` in your config");
         }
     }
+    println!(
+        "  {y}not auto-deleted:{r} pruning boot entries by hand risks an unbootable system; \
+         the configurationLimit option is the real fix, not a cleanup pass.",
+        y = yellow(),
+        r = reset()
+    );
 
     section("Biggest paths in your current system closure");
     if let Some(out) = run_captured("nix", &["path-info", "-rS", "/run/current-system"]) {
@@ -122,7 +117,9 @@ fn status() -> Result<()> {
         }
     }
 
-    section("Stray build results / dev-shell roots pinning old store paths");
+    section(
+        "Stray build results / dev-shell roots pinning old store paths (ALL get nuked, any age)",
+    );
     let roots = find_home_roots(&home);
     if roots.is_empty() {
         println!("  none found under {}", home.display());
@@ -130,10 +127,10 @@ fn status() -> Result<()> {
         for r in &roots {
             println!("  {} ({})", r.display(), describe_age(r));
         }
-        println!("  -> `nix-reaper clean` removes the stale ones");
+        println!("  -> `nix-reaper clean` removes every one of these, regardless of age");
     }
 
-    section("Non-Nix disk hogs");
+    section("Non-Nix disk hogs (ALL get nuked)");
     if command_exists("docker") {
         if let Some(out) = run_captured("docker", &["system", "df"]) {
             println!("{}", indent(&out));
@@ -149,12 +146,41 @@ fn status() -> Result<()> {
     }
     let cache_dir = format!("{}/.cache", home.display());
     if let Some(out) = run_captured("du", &["-sh", &cache_dir]) {
-        println!("  ~/.cache: {out}");
+        println!("  ~/.cache: {out}  (clean empties this completely)");
+    }
+    let trash_dir = format!("{}/.local/share/Trash", home.display());
+    if Path::new(&trash_dir).exists() {
+        if let Some(out) = run_captured("du", &["-sh", &trash_dir]) {
+            println!("  ~/.local/share/Trash: {out}  (clean empties this completely)");
+        }
+    }
+    if command_exists("cargo") {
+        let cargo_reg = format!("{}/.cargo/registry", home.display());
+        if let Some(out) = run_captured("du", &["-sh", &cargo_reg]) {
+            println!("  ~/.cargo/registry: {out}  (clean nukes cache+src)");
+        }
+    }
+    if command_exists("npm") {
+        if let Some(out) = run_captured("npm", &["cache", "verify"]) {
+            println!("  npm cache: {}", indent(&out));
+        }
+    }
+    if command_exists("go") {
+        let go_build_cache = format!("{}/.cache/go-build", home.display());
+        if let Some(out) = run_captured("du", &["-sh", &go_build_cache]) {
+            println!("  ~/.cache/go-build: {out}  (clean nukes this)");
+        }
+    }
+    let coredumps = "/var/lib/systemd/coredump";
+    if Path::new(coredumps).exists() {
+        if let Some(out) = run_captured("du", &["-sh", coredumps]) {
+            println!("  {coredumps}: {out}  (clean nukes this)");
+        }
     }
 
     println!();
     println!(
-        "Run `nix-reaper clean --dry-run` to preview a full cleanup, or `nix-reaper clean` to just run it."
+        "Run `nix-reaper clean --dry-run` to preview the full nuke, or `nix-reaper clean` to just do it."
     );
     Ok(())
 }
@@ -171,13 +197,18 @@ fn clean(args: CleanArgs) -> Result<()> {
             y = yellow(),
             r = reset()
         );
+    } else {
+        println!(
+            "{red}{b}>>> NUKING <<<{r}\n",
+            red = red(),
+            b = bold(),
+            r = reset()
+        );
     }
 
     let before_size = run_captured("du", &["-sh", "/nix/store"]);
 
-    // 1. system profile generations (root-owned, needs sudo)
-    let keep_system_flag = format!("+{}", args.keep_system);
-    let why_system = format!("keep the {} newest system generations", args.keep_system);
+    // 1. system profile generations (root-owned, needs sudo) — delete ALL but current.
     step(
         dry_run,
         true,
@@ -186,29 +217,32 @@ fn clean(args: CleanArgs) -> Result<()> {
             "-p",
             "/nix/var/nix/profiles/system",
             "--delete-generations",
-            keep_system_flag.as_str(),
+            "old",
         ],
-        &why_system,
+        "delete every system generation except the one currently in use",
         false,
     );
 
-    // 2. your own user profile generations
-    let keep_user_flag = format!("+{}", args.keep_user);
-    let why_user = format!("keep the {} newest generations of your own user profile", args.keep_user);
+    // 2. your own user profile generations — delete ALL but current.
     step(
         dry_run,
         false,
         "nix-env",
-        &["--delete-generations", keep_user_flag.as_str()],
-        &why_user,
+        &["--delete-generations", "old"],
+        "delete every generation of your own user profile except the current one",
         false,
     );
 
-    // 3. home-manager generations, if present
+    // 3. home-manager generations, if present — expire everything not brand new.
     if command_exists("home-manager") {
-        let hm_flag = format!("-{} days", args.keep_home_days);
-        let why_hm = format!("expire home-manager generations older than {} days", args.keep_home_days);
-        step(dry_run, false, "home-manager", &["expire-generations", hm_flag.as_str()], &why_hm, false);
+        step(
+            dry_run,
+            false,
+            "home-manager",
+            &["expire-generations", "-1 seconds"],
+            "expire every home-manager generation older than right now",
+            false,
+        );
     }
 
     // 4. actual gc — nix logs "finding garbage collector roots...", "deleting garbage...",
@@ -234,37 +268,118 @@ fn clean(args: CleanArgs) -> Result<()> {
     );
 
     // 6. journal
-    let journal_off = matches!(args.journal.to_lowercase().as_str(), "off" | "none" | "skip");
+    let journal_off = matches!(
+        args.journal.to_lowercase().as_str(),
+        "off" | "none" | "skip"
+    );
     if !journal_off {
-        let flag = format!("--vacuum-size={}", args.journal);
-        let why_journal = format!("shrink the systemd journal down to {}", args.journal);
-        step(dry_run, true, "journalctl", &[flag.as_str()], &why_journal, false);
+        let flag = format!("--vacuum-time={}", args.journal);
+        let why_journal = format!(
+            "shrink the systemd journal down to the last {}",
+            args.journal
+        );
+        step(
+            dry_run,
+            true,
+            "journalctl",
+            &[flag.as_str()],
+            &why_journal,
+            false,
+        );
     }
 
-    // 7. docker / podman
+    // 7. docker — images, containers, volumes, AND build cache. No half measures.
     if command_exists("docker") {
         step(
             dry_run,
             false,
             "docker",
             &["system", "prune", "-af", "--volumes"],
-            "remove unused docker images, stopped containers, and unused volumes",
+            "remove every unused docker image, stopped container, and unused volume",
+            false,
+        );
+        step(
+            dry_run,
+            false,
+            "docker",
+            &["builder", "prune", "-af"],
+            "wipe the docker buildx/BuildKit cache",
             false,
         );
     }
+
+    // 8. podman — same treatment.
     if command_exists("podman") {
         step(
             dry_run,
             false,
             "podman",
             &["system", "prune", "-af", "--volumes"],
-            "remove unused podman images, stopped containers, and unused volumes",
+            "remove every unused podman image, stopped container, and unused volume",
+            false,
+        );
+        step(
+            dry_run,
+            false,
+            "podman",
+            &["image", "prune", "-af"],
+            "remove every dangling/unused podman image",
             false,
         );
     }
 
-    // 8. stray build result / dev-shell gcroots under $HOME
-    clean_roots(&home, dry_run, args.roots_older_than_days);
+    // 9. stray build result / dev-shell gcroots under $HOME — ALL of them, any age.
+    clean_roots(&home, dry_run);
+
+    // 10. general cache / trash / coredump nuking.
+    nuke_dir_contents(dry_run, "~/.cache", &home.join(".cache"));
+    nuke_dir_contents(
+        dry_run,
+        "~/.local/share/Trash",
+        &home.join(".local/share/Trash"),
+    );
+
+    let coredumps = Path::new("/var/lib/systemd/coredump");
+    if coredumps.exists() {
+        // `find -mindepth 1 -delete` empties the directory without the trailing-dot
+        // problem `rm -rf .../.` has (rm refuses to remove `.`/`..`) and without the
+        // empty-glob problem a bare `.../*` has (fails if there's nothing to expand).
+        step(
+            dry_run,
+            true,
+            "find",
+            &["/var/lib/systemd/coredump", "-mindepth", "1", "-delete"],
+            "delete every stored systemd coredump",
+            false,
+        );
+    }
+
+    // 11. dev-tool caches, only if the tool is actually installed.
+    if command_exists("cargo") {
+        nuke_dir_contents(
+            dry_run,
+            "~/.cargo/registry/cache",
+            &home.join(".cargo/registry/cache"),
+        );
+        nuke_dir_contents(
+            dry_run,
+            "~/.cargo/registry/src",
+            &home.join(".cargo/registry/src"),
+        );
+    }
+    if command_exists("npm") {
+        step(
+            dry_run,
+            false,
+            "npm",
+            &["cache", "clean", "--force"],
+            "wipe the entire npm cache",
+            false,
+        );
+    }
+    if command_exists("go") {
+        nuke_dir_contents(dry_run, "~/.cache/go-build", &home.join(".cache/go-build"));
+    }
 
     if !dry_run {
         if let Some(before) = before_size {
@@ -277,6 +392,12 @@ fn clean(args: CleanArgs) -> Result<()> {
                 );
             }
         }
+        println!(
+            "\n{g}{b}>>> DONE <<<{r}",
+            g = green(),
+            b = bold(),
+            r = reset()
+        );
     } else {
         println!(
             "\n{d}Looks right? Re-run the same command without --dry-run to actually do it.{r}",
@@ -291,7 +412,7 @@ fn clean(args: CleanArgs) -> Result<()> {
 /// Finds symlinks under `home` that show up as (or point to) live Nix GC roots —
 /// this catches `nix build` `result*` links and nix-direnv `.direnv/*` profiles,
 /// which otherwise keep entire closures alive forever even after you stop caring
-/// about the project.
+/// about the project. No age filtering: if it's here, `clean` removes it.
 fn find_home_roots(home: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Some(text) = run_captured("nix-store", &["--gc", "--print-roots"]) else {
@@ -322,27 +443,18 @@ fn find_home_roots(home: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn clean_roots(home: &Path, dry_run: bool, cutoff_days: u64) {
+/// Removes every stray gcroot symlink found under `home`, unconditionally. No cutoff,
+/// no "older than N days" — if it's a symlink pinning something outside the store, it's gone.
+fn clean_roots(home: &Path, dry_run: bool) {
     let roots = find_home_roots(home);
     if roots.is_empty() {
         println!("[roots] none found under {}", home.display());
         return;
     }
     for r in &roots {
-        let age_days = fs::symlink_metadata(r)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|m| SystemTime::now().duration_since(m).ok())
-            .map(|d| d.as_secs() / 86400)
-            .unwrap_or(u64::MAX);
-
-        if age_days < cutoff_days {
-            continue;
-        }
-
         if dry_run {
             println!(
-                "{y}[dry-run]{r} rm {}   ({age_days}d old — project directory stays, only the pinning symlink goes)",
+                "{y}[dry-run]{r} rm {}   (project directory stays, only the pinning symlink goes)",
                 r.display(),
                 y = yellow(),
                 r = reset()
@@ -353,12 +465,71 @@ fn clean_roots(home: &Path, dry_run: bool, cutoff_days: u64) {
         match fs::symlink_metadata(r) {
             Ok(meta) if meta.file_type().is_symlink() => match fs::remove_file(r) {
                 Ok(_) => println!("{g}removed{r} {}", r.display(), g = green(), r = reset()),
-                Err(e) => println!("{red}could not remove {}: {e}{r}", r.display(), red = red(), r = reset()),
+                Err(e) => println!(
+                    "{red}could not remove {}: {e}{r}",
+                    r.display(),
+                    red = red(),
+                    r = reset()
+                ),
             },
             Ok(_) => println!("skipping {} (not a symlink, leaving it alone)", r.display()),
             Err(_) => println!("skipping {} (already gone)", r.display()),
         }
     }
+}
+
+/// Deletes every entry inside `dir` (not the directory itself), unconditionally.
+/// Used for cache/trash/build-cache directories where "everything in here" is the point.
+fn nuke_dir_contents(dry_run: bool, label: &str, dir: &Path) {
+    if !dir.exists() {
+        return;
+    }
+    if dry_run {
+        println!(
+            "{y}[dry-run]{r} rm -rf {}/*   ({label})",
+            dir.display(),
+            y = yellow(),
+            r = reset()
+        );
+        return;
+    }
+    println!(
+        "\n{c}->{r} {b}nuking {label}{r}  {d}({}){r}",
+        dir.display(),
+        c = cyan(),
+        b = bold(),
+        d = dim(),
+        r = reset()
+    );
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            println!(
+                "   {red}couldn't read {}: {e}{r}",
+                dir.display(),
+                red = red(),
+                r = reset()
+            );
+            return;
+        }
+    };
+    let mut count: u64 = 0;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        let removed = if p.is_dir() && !p.is_symlink() {
+            fs::remove_dir_all(&p)
+        } else {
+            fs::remove_file(&p)
+        };
+        if removed.is_ok() {
+            count += 1;
+        }
+    }
+    println!(
+        "   {g}ok{r} — removed {count} entries",
+        g = green(),
+        r = reset()
+    );
 }
 
 // ---------- small helpers ----------
@@ -455,7 +626,12 @@ fn run_streamed(
     let mut st = progress.lock().unwrap();
     if st.shown {
         clear_progress_line();
-        println!("   {g}deleted {} store paths{r}", st.deleted, g = green(), r = reset());
+        println!(
+            "   {g}deleted {} store paths{r}",
+            st.deleted,
+            g = green(),
+            r = reset()
+        );
         st.shown = false;
     }
     drop(st);
@@ -545,11 +721,19 @@ fn dirs_home() -> Result<PathBuf> {
 }
 
 fn section(title: &str) {
-    println!("\n{b}{c}── {title} ──{r}", b = bold(), c = cyan(), r = reset());
+    println!(
+        "\n{b}{c}── {title} ──{r}",
+        b = bold(),
+        c = cyan(),
+        r = reset()
+    );
 }
 
 fn indent(s: &str) -> String {
-    s.lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_generation_count(label: &str, profile: &str) {
