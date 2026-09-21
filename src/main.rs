@@ -43,6 +43,12 @@ struct CleanArgs {
     #[arg(long, value_name = "TIME", default_value = "1s")]
     journal: String,
 
+    /// Also empty ~/.cache completely. Off by default — a lot of apps (browsers, editors,
+    /// language servers) treat ~/.cache as a place to keep things they'd rather not
+    /// regenerate from scratch, so this one opts in instead of being on by default.
+    #[arg(long)]
+    clear_cache: bool,
+
     /// No longer needed — `clean` already nukes everything --all used to and then some.
     /// Kept as a harmless no-op so old scripts/aliases that still pass it don't break.
     #[arg(long, hide = true)]
@@ -146,7 +152,9 @@ fn status() -> Result<()> {
     }
     let cache_dir = format!("{}/.cache", home.display());
     if let Some(out) = run_captured("du", &["-sh", &cache_dir]) {
-        println!("  ~/.cache: {out}  (clean empties this completely)");
+        println!(
+            "  ~/.cache: {out}  (clean --clear-cache empties this completely; skipped otherwise)"
+        );
     }
     let trash_dir = format!("{}/.local/share/Trash", home.display());
     if Path::new(&trash_dir).exists() {
@@ -332,7 +340,15 @@ fn clean(args: CleanArgs) -> Result<()> {
     clean_roots(&home, dry_run);
 
     // 10. general cache / trash / coredump nuking.
-    nuke_dir_contents(dry_run, "~/.cache", &home.join(".cache"));
+    if args.clear_cache {
+        nuke_dir_contents(dry_run, "~/.cache", &home.join(".cache"));
+    } else {
+        println!(
+            "\n{d}[~/.cache] skipped — pass --clear-cache to empty it too{r}",
+            d = dim(),
+            r = reset()
+        );
+    }
     nuke_dir_contents(
         dry_run,
         "~/.local/share/Trash",
