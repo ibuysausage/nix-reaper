@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::SystemTime;
 
 #[derive(Parser)]
@@ -209,8 +211,9 @@ fn clean(args: CleanArgs) -> Result<()> {
         step(dry_run, false, "home-manager", &["expire-generations", hm_flag.as_str()], &why_hm, false);
     }
 
-    // 4. actual gc — this is the one that can spew thousands of "deleting '/nix/store/...'"
-    // lines, so it's the one we filter down to a live counter instead of streaming raw.
+    // 4. actual gc — nix logs "finding garbage collector roots...", "deleting garbage...",
+    // and every "deleting '/nix/store/...'" line to STDERR, not stdout, so we have to
+    // capture and filter both streams or the deleting lines sail straight through.
     step(
         dry_run,
         false,
@@ -390,13 +393,27 @@ fn step(dry_run: bool, sudo: bool, program: &str, args: &[&str], why: &str, filt
     }
 }
 
-/// Runs `program` (optionally under sudo) and streams its stdout to us, line by
-/// line, so we can quiet down chatty commands. When `filter_deleting` is set,
-/// individual `deleting '/nix/store/...'` lines are never printed at all — they
-/// collapse into a single live-updating spinner line instead. Everything else
-/// (in particular Nix's own final "N store paths deleted, X freed" summary)
-/// still prints, and gets highlighted green so it stands out. stderr is left
-/// alone so real warnings/errors still show through.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Shared between the stdout- and stderr-reading threads so the spinner/counter
+/// stays consistent (and writes don't interleave) no matter which stream a given
+/// line of Nix's output actually arrives on.
+struct Progress {
+    deleted: u64,
+    frame: usize,
+    shown: bool,
+}
+
+/// Runs `program` (optionally under sudo) and streams BOTH its stdout and stderr,
+/// line by line, so we can quiet down chatty commands. Nix's own progress logging
+/// (`finding garbage collector roots...`, `deleting '...'`, etc.) goes to stderr,
+/// not stdout — so both streams need the same filtering or the noisy lines just
+/// slip through on the one we're not watching.
+///
+/// When `filter_deleting` is set, individual `deleting '/nix/store/...'` lines are
+/// never printed — they collapse into one live-updating spinner line instead.
+/// Everything else (in particular Nix's own final "N store paths deleted, X freed"
+/// summary) still prints, highlighted green so it stands out.
 fn run_streamed(
     sudo: bool,
     program: &str,
@@ -414,60 +431,92 @@ fn run_streamed(
         c
     };
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
-    let reader = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("piped stderr");
 
-    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let mut frame = 0usize;
-    let mut deleted: u64 = 0;
-    let mut progress_shown = false;
-    let mut out = std::io::stdout();
+    let progress = Arc::new(Mutex::new(Progress {
+        deleted: 0,
+        frame: 0,
+        shown: false,
+    }));
 
-    let clear_progress = |out: &mut std::io::Stdout| {
-        let _ = write!(out, "\r{:width$}\r", "", width = 64);
-    };
+    let progress_err = Arc::clone(&progress);
+    let err_thread = thread::spawn(move || {
+        stream_filtered(BufReader::new(stderr), filter_deleting, &progress_err);
+    });
 
+    stream_filtered(BufReader::new(stdout), filter_deleting, &progress);
+    let _ = err_thread.join();
+
+    // Clear a still-live spinner line before letting the final "ok"/exit status print.
+    let mut st = progress.lock().unwrap();
+    if st.shown {
+        clear_progress_line();
+        println!("   {g}deleted {} store paths{r}", st.deleted, g = green(), r = reset());
+        st.shown = false;
+    }
+    drop(st);
+
+    child.wait()
+}
+
+fn stream_filtered<R: BufRead>(reader: R, filter_deleting: bool, progress: &Mutex<Progress>) {
     for line in reader.lines() {
-        let line = line?;
+        let Ok(line) = line else { break };
 
         if filter_deleting && line.starts_with("deleting '") {
-            deleted += 1;
-            frame = (frame + 1) % SPINNER.len();
+            let mut st = progress.lock().unwrap();
+            st.deleted += 1;
+            st.frame = (st.frame + 1) % SPINNER.len();
+            let mut out = std::io::stdout();
             let _ = write!(
                 out,
-                "\r   {c}{spin}{r} {d}clearing store paths...{r} {b}{deleted}{r} removed",
+                "\r   {c}{spin}{r} {d}clearing store paths...{r} {b}{n}{r} removed",
                 c = cyan(),
-                spin = SPINNER[frame],
+                spin = SPINNER[st.frame],
                 r = reset(),
                 d = dim(),
                 b = bold(),
+                n = st.deleted,
             );
             let _ = out.flush();
-            progress_shown = true;
+            st.shown = true;
             continue;
         }
 
-        if progress_shown {
-            clear_progress(&mut out);
-            progress_shown = false;
+        let mut st = progress.lock().unwrap();
+        if st.shown {
+            clear_progress_line();
+            st.shown = false;
+        }
+        drop(st);
+
+        if line.trim().is_empty() {
+            continue;
         }
 
         if filter_deleting && line.contains("store paths deleted") {
             println!("   {g}{line}{r}", g = green(), r = reset());
-        } else if !line.trim().is_empty() {
+        } else if filter_deleting
+            && (line.starts_with("finding garbage collector roots")
+                || line.starts_with("deleting garbage")
+                || line.starts_with("removing stale temporary roots file"))
+        {
+            // Routine gc chatter — same category as the deleting lines, just skip it.
+            continue;
+        } else {
             println!("   {line}");
         }
     }
+}
 
-    if progress_shown {
-        clear_progress(&mut out);
-        println!("   {g}deleted {deleted} store paths{r}", g = green(), r = reset());
-    }
-
-    child.wait()
+fn clear_progress_line() {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\r{:width$}\r", "", width = 64);
+    let _ = out.flush();
 }
 
 fn run_captured(program: &str, args: &[&str]) -> Option<String> {
