@@ -1,20 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
-
-// ---------- tiny ANSI helpers (no extra crate needed) ----------
-
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const CYAN: &str = "\x1b[36m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
 
 #[derive(Parser)]
 #[command(
@@ -31,14 +21,15 @@ struct Cli {
 enum Cmd {
     /// Report what's currently taking up space. Read-only, changes nothing.
     Status,
-    /// Clean things up. Runs for real by default; pass --dry-run to preview instead.
+    /// Deep-clean everything: generations, gc, store optimise, journal, docker/podman,
+    /// and stray gcroots. Runs for real by default — pass --dry-run to preview instead.
     Clean(CleanArgs),
 }
 
 #[derive(Args)]
 struct CleanArgs {
-    /// Preview the plan without changing anything. Without this flag, nix-reaper runs for real.
-    #[arg(short = 'n', long)]
+    /// Only print what would happen — don't actually delete/run anything.
+    #[arg(long)]
     dry_run: bool,
 
     /// Keep this many NixOS system profile generations
@@ -53,32 +44,17 @@ struct CleanArgs {
     #[arg(long, default_value_t = 30)]
     keep_home_days: u32,
 
-    /// Run `nix-collect-garbage -d` after trimming generations
-    #[arg(long)]
-    gc: bool,
+    /// Vacuum the systemd journal down to this size, e.g. 200M. Pass "off" to skip journal cleanup.
+    #[arg(long, value_name = "SIZE", default_value = "200M")]
+    journal: String,
 
-    /// Run the store optimiser (hardlinks duplicate files) after gc
-    #[arg(long)]
-    optimise: bool,
-
-    /// Prune unused docker/podman images, containers and volumes, if either is installed
-    #[arg(long)]
-    docker: bool,
-
-    /// Vacuum the systemd journal down to this size, e.g. 200M. Omit to skip.
-    #[arg(long, value_name = "SIZE")]
-    journal: Option<String>,
-
-    /// Find & optionally remove stray `result` symlinks / dev-shell profiles pinning old store paths alive
-    #[arg(long)]
-    roots: bool,
-
-    /// Only remove root symlinks older than this many days (used with --roots)
+    /// Only remove root symlinks older than this many days
     #[arg(long, default_value_t = 30)]
     roots_older_than_days: u64,
 
-    /// Shortcut: turn on --gc --optimise --docker --roots and set journal=200M, using the defaults above
-    #[arg(long)]
+    /// No longer needed — `clean` already does everything --all used to. Kept as a harmless no-op
+    /// so old scripts/aliases that still pass it don't break.
+    #[arg(long, hide = true)]
     all: bool,
 }
 
@@ -152,7 +128,7 @@ fn status() -> Result<()> {
         for r in &roots {
             println!("  {} ({})", r.display(), describe_age(r));
         }
-        println!("  -> `nix-reaper clean --roots` removes the stale ones");
+        println!("  -> `nix-reaper clean` removes the stale ones");
     }
 
     section("Non-Nix disk hogs");
@@ -175,28 +151,24 @@ fn status() -> Result<()> {
     }
 
     println!();
-    println!("Run `nix-reaper clean --all` to actually clean everything (add --dry-run first if you want to preview it).");
+    println!(
+        "Run `nix-reaper clean --dry-run` to preview a full cleanup, or `nix-reaper clean` to just run it."
+    );
     Ok(())
 }
 
 // ---------- clean ----------
 
-fn clean(mut args: CleanArgs) -> Result<()> {
-    if args.all {
-        args.gc = true;
-        args.optimise = true;
-        args.docker = true;
-        args.roots = true;
-        if args.journal.is_none() {
-            args.journal = Some("200M".to_string());
-        }
-    }
-
+fn clean(args: CleanArgs) -> Result<()> {
     let home = dirs_home()?;
     let dry_run = args.dry_run;
 
     if dry_run {
-        println!("{DIM}DRY RUN — nothing will actually change. Drop --dry-run to run this for real.{RESET}\n");
+        println!(
+            "{y}DRY RUN{r} — nothing will actually change. Drop --dry-run once this plan looks right.\n",
+            y = yellow(),
+            r = reset()
+        );
     }
 
     let before_size = run_captured("du", &["-sh", "/nix/store"]);
@@ -215,101 +187,99 @@ fn clean(mut args: CleanArgs) -> Result<()> {
             keep_system_flag.as_str(),
         ],
         &why_system,
+        false,
     );
 
     // 2. your own user profile generations
     let keep_user_flag = format!("+{}", args.keep_user);
-    let why_user = format!(
-        "keep the {} newest generations of your own user profile",
-        args.keep_user
-    );
+    let why_user = format!("keep the {} newest generations of your own user profile", args.keep_user);
     step(
         dry_run,
         false,
         "nix-env",
         &["--delete-generations", keep_user_flag.as_str()],
         &why_user,
+        false,
     );
 
     // 3. home-manager generations, if present
     if command_exists("home-manager") {
         let hm_flag = format!("-{} days", args.keep_home_days);
-        let why_hm = format!(
-            "expire home-manager generations older than {} days",
-            args.keep_home_days
-        );
-        step(
-            dry_run,
-            false,
-            "home-manager",
-            &["expire-generations", hm_flag.as_str()],
-            &why_hm,
-        );
+        let why_hm = format!("expire home-manager generations older than {} days", args.keep_home_days);
+        step(dry_run, false, "home-manager", &["expire-generations", hm_flag.as_str()], &why_hm, false);
     }
 
-    // 4. actual gc — this is the noisy one, so it gets the quiet streaming path
-    if args.gc {
-        gc_step(
-            dry_run,
-            "nix-collect-garbage",
-            &["-d"],
-            "delete everything no longer reachable from a live generation (add sudo yourself if this errors on permissions)",
-        );
-    }
+    // 4. actual gc — this is the one that can spew thousands of "deleting '/nix/store/...'"
+    // lines, so it's the one we filter down to a live counter instead of streaming raw.
+    step(
+        dry_run,
+        false,
+        "nix-collect-garbage",
+        &["-d"],
+        "delete everything no longer reachable from a live generation (add sudo yourself if this errors on permissions)",
+        true,
+    );
 
     // 5. optimise
-    if args.optimise {
-        step(
-            dry_run,
-            false,
-            "nix",
-            &["store", "optimise"],
-            "hardlink duplicate files inside the store (saves space, deletes nothing reachable)",
-        );
-    }
+    step(
+        dry_run,
+        false,
+        "nix",
+        &["store", "optimise"],
+        "hardlink duplicate files inside the store (saves space, deletes nothing reachable)",
+        false,
+    );
 
     // 6. journal
-    if let Some(size) = &args.journal {
-        let flag = format!("--vacuum-size={size}");
-        let why_journal = format!("shrink the systemd journal down to {size}");
-        step(dry_run, true, "journalctl", &[flag.as_str()], &why_journal);
+    let journal_off = matches!(args.journal.to_lowercase().as_str(), "off" | "none" | "skip");
+    if !journal_off {
+        let flag = format!("--vacuum-size={}", args.journal);
+        let why_journal = format!("shrink the systemd journal down to {}", args.journal);
+        step(dry_run, true, "journalctl", &[flag.as_str()], &why_journal, false);
     }
 
     // 7. docker / podman
-    if args.docker {
-        if command_exists("docker") {
-            step(
-                dry_run,
-                false,
-                "docker",
-                &["system", "prune", "-af", "--volumes"],
-                "remove unused docker images, stopped containers, and unused volumes",
-            );
-        }
-        if command_exists("podman") {
-            step(
-                dry_run,
-                false,
-                "podman",
-                &["system", "prune", "-af", "--volumes"],
-                "remove unused podman images, stopped containers, and unused volumes",
-            );
-        }
+    if command_exists("docker") {
+        step(
+            dry_run,
+            false,
+            "docker",
+            &["system", "prune", "-af", "--volumes"],
+            "remove unused docker images, stopped containers, and unused volumes",
+            false,
+        );
+    }
+    if command_exists("podman") {
+        step(
+            dry_run,
+            false,
+            "podman",
+            &["system", "prune", "-af", "--volumes"],
+            "remove unused podman images, stopped containers, and unused volumes",
+            false,
+        );
     }
 
     // 8. stray build result / dev-shell gcroots under $HOME
-    if args.roots {
-        clean_roots(&home, dry_run, args.roots_older_than_days);
-    }
+    clean_roots(&home, dry_run, args.roots_older_than_days);
 
     if !dry_run {
         if let Some(before) = before_size {
             if let Some(after) = run_captured("du", &["-sh", "/nix/store"]) {
-                println!("\n{BOLD}nix store size:{RESET} {before} -> {GREEN}{after}{RESET}");
+                println!(
+                    "\n{b}nix store size:{r} {before} -> {g}{after}{r}",
+                    b = bold(),
+                    g = green(),
+                    r = reset()
+                );
             }
         }
     } else {
-        println!("\n{DIM}Looks right? Re-run the same command without --dry-run to actually do it.{RESET}");
+        println!(
+            "\n{d}Looks right? Re-run the same command without --dry-run to actually do it.{r}",
+            d = dim(),
+            r = reset()
+        );
     }
 
     Ok(())
@@ -352,7 +322,7 @@ fn find_home_roots(home: &Path) -> Vec<PathBuf> {
 fn clean_roots(home: &Path, dry_run: bool, cutoff_days: u64) {
     let roots = find_home_roots(home);
     if roots.is_empty() {
-        println!("{DIM}[roots] none found under {}{RESET}", home.display());
+        println!("[roots] none found under {}", home.display());
         return;
     }
     for r in &roots {
@@ -369,29 +339,28 @@ fn clean_roots(home: &Path, dry_run: bool, cutoff_days: u64) {
 
         if dry_run {
             println!(
-                "{DIM}[dry-run] rm {}   ({age_days}d old — project directory stays, only the pinning symlink goes){RESET}",
-                r.display()
+                "{y}[dry-run]{r} rm {}   ({age_days}d old — project directory stays, only the pinning symlink goes)",
+                r.display(),
+                y = yellow(),
+                r = reset()
             );
             continue;
         }
 
         match fs::symlink_metadata(r) {
             Ok(meta) if meta.file_type().is_symlink() => match fs::remove_file(r) {
-                Ok(_) => println!("{GREEN}removed{RESET} {}", r.display()),
-                Err(e) => println!("{RED}could not remove{RESET} {}: {e}", r.display()),
+                Ok(_) => println!("{g}removed{r} {}", r.display(), g = green(), r = reset()),
+                Err(e) => println!("{red}could not remove {}: {e}{r}", r.display(), red = red(), r = reset()),
             },
-            Ok(_) => println!(
-                "{YELLOW}skipping{RESET} {} (not a symlink, leaving it alone)",
-                r.display()
-            ),
-            Err(_) => println!("{DIM}skipping {} (already gone){RESET}", r.display()),
+            Ok(_) => println!("skipping {} (not a symlink, leaving it alone)", r.display()),
+            Err(_) => println!("skipping {} (already gone)", r.display()),
         }
     }
 }
 
 // ---------- small helpers ----------
 
-fn step(dry_run: bool, sudo: bool, program: &str, args: &[&str], why: &str) {
+fn step(dry_run: bool, sudo: bool, program: &str, args: &[&str], why: &str, filter_deleting: bool) {
     let mut parts: Vec<&str> = Vec::new();
     if sudo {
         parts.push("sudo");
@@ -401,102 +370,104 @@ fn step(dry_run: bool, sudo: bool, program: &str, args: &[&str], why: &str) {
     let rendered = parts.join(" ");
 
     if dry_run {
-        println!("{DIM}[dry-run] {rendered}{RESET}");
-        println!("{DIM}          ({why}){RESET}");
+        println!("{y}[dry-run]{r} {rendered}", y = yellow(), r = reset());
+        println!("          {d}({why}){r}", d = dim(), r = reset());
         return;
     }
 
-    println!("{GREEN}{BOLD}->{RESET} {BOLD}{rendered}{RESET}  {DIM}({why}){RESET}");
-    let status = if sudo {
-        Command::new("sudo").arg(program).args(args).status()
-    } else {
-        Command::new(program).args(args).status()
-    };
-    match status {
-        Ok(s) if s.success() => println!("   {GREEN}ok{RESET}"),
-        Ok(s) => println!("   {YELLOW}exited with {s}{RESET}"),
-        Err(e) => println!("   {RED}failed to run: {e}{RESET}"),
+    println!(
+        "\n{c}->{r} {b}{rendered}{r}  {d}({why}){r}",
+        c = cyan(),
+        b = bold(),
+        d = dim(),
+        r = reset()
+    );
+
+    match run_streamed(sudo, program, args, filter_deleting) {
+        Ok(status) if status.success() => println!("   {g}ok{r}", g = green(), r = reset()),
+        Ok(status) => println!("   {red}exited with {status}{r}", red = red(), r = reset()),
+        Err(e) => println!("   {red}failed to run: {e}{r}", red = red(), r = reset()),
     }
 }
 
-/// Like `step`, but for commands (namely `nix-collect-garbage -d`) that dump one
-/// `deleting '/nix/store/...'` line per path. Instead of letting that flood the
-/// terminal, we count them and show a single updating counter, still printing
-/// anything else (the hardlink-savings note, the final summary line) normally.
-fn gc_step(dry_run: bool, program: &str, args: &[&str], why: &str) {
-    let rendered = std::iter::once(program)
-        .chain(args.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ");
+/// Runs `program` (optionally under sudo) and streams its stdout to us, line by
+/// line, so we can quiet down chatty commands. When `filter_deleting` is set,
+/// individual `deleting '/nix/store/...'` lines are never printed at all — they
+/// collapse into a single live-updating spinner line instead. Everything else
+/// (in particular Nix's own final "N store paths deleted, X freed" summary)
+/// still prints, and gets highlighted green so it stands out. stderr is left
+/// alone so real warnings/errors still show through.
+fn run_streamed(
+    sudo: bool,
+    program: &str,
+    args: &[&str],
+    filter_deleting: bool,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut cmd = if sudo {
+        let mut c = Command::new("sudo");
+        c.arg(program);
+        c.args(args);
+        c
+    } else {
+        let mut c = Command::new(program);
+        c.args(args);
+        c
+    };
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
 
-    if dry_run {
-        println!("{DIM}[dry-run] {rendered}{RESET}");
-        println!("{DIM}          ({why}){RESET}");
-        return;
-    }
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let reader = BufReader::new(stdout);
 
-    println!("{GREEN}{BOLD}->{RESET} {BOLD}{rendered}{RESET}  {DIM}({why}){RESET}");
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let mut frame = 0usize;
+    let mut deleted: u64 = 0;
+    let mut progress_shown = false;
+    let mut out = std::io::stdout();
 
-    let child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            println!("   {RED}failed to run: {e}{RESET}");
-            return;
-        }
+    let clear_progress = |out: &mut std::io::Stdout| {
+        let _ = write!(out, "\r{:width$}\r", "", width = 64);
     };
 
-    let stderr = child.stderr.take();
-    let stderr_handle = stderr.map(|s| {
-        std::thread::spawn(move || {
-            for line in BufReader::new(s).lines().map_while(std::result::Result::ok) {
-                println!("   {YELLOW}{line}{RESET}");
-            }
-        })
-    });
+    for line in reader.lines() {
+        let line = line?;
 
-    if let Some(stdout) = child.stdout.take() {
-        let mut deleted_count: u64 = 0;
-        let mut counter_on_screen = false;
-
-        for line in BufReader::new(stdout)
-            .lines()
-            .map_while(std::result::Result::ok)
-        {
-            if line.starts_with("deleting '") {
-                deleted_count += 1;
-                print!("\r   {DIM}deleting store paths… {deleted_count}{RESET}");
-                let _ = std::io::stdout().flush();
-                counter_on_screen = true;
-                continue;
-            }
-            if counter_on_screen {
-                println!();
-                counter_on_screen = false;
-            }
-            if !line.trim().is_empty() {
-                println!("   {line}");
-            }
+        if filter_deleting && line.starts_with("deleting '") {
+            deleted += 1;
+            frame = (frame + 1) % SPINNER.len();
+            let _ = write!(
+                out,
+                "\r   {c}{spin}{r} {d}clearing store paths...{r} {b}{deleted}{r} removed",
+                c = cyan(),
+                spin = SPINNER[frame],
+                r = reset(),
+                d = dim(),
+                b = bold(),
+            );
+            let _ = out.flush();
+            progress_shown = true;
+            continue;
         }
-        if counter_on_screen {
-            println!();
+
+        if progress_shown {
+            clear_progress(&mut out);
+            progress_shown = false;
+        }
+
+        if filter_deleting && line.contains("store paths deleted") {
+            println!("   {g}{line}{r}", g = green(), r = reset());
+        } else if !line.trim().is_empty() {
+            println!("   {line}");
         }
     }
 
-    if let Some(h) = stderr_handle {
-        let _ = h.join();
+    if progress_shown {
+        clear_progress(&mut out);
+        println!("   {g}deleted {deleted} store paths{r}", g = green(), r = reset());
     }
 
-    match child.wait() {
-        Ok(s) if s.success() => println!("   {GREEN}ok{RESET}"),
-        Ok(s) => println!("   {YELLOW}exited with {s}{RESET}"),
-        Err(e) => println!("   {RED}failed to wait on child: {e}{RESET}"),
-    }
+    child.wait()
 }
 
 fn run_captured(program: &str, args: &[&str]) -> Option<String> {
@@ -525,14 +496,11 @@ fn dirs_home() -> Result<PathBuf> {
 }
 
 fn section(title: &str) {
-    println!("\n{BOLD}{CYAN}== {title} =={RESET}");
+    println!("\n{b}{c}── {title} ──{r}", b = bold(), c = cyan(), r = reset());
 }
 
 fn indent(s: &str) -> String {
-    s.lines()
-        .map(|l| format!("  {l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    s.lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n")
 }
 
 fn print_generation_count(label: &str, profile: &str) {
@@ -557,4 +525,42 @@ fn describe_age(path: &Path) -> String {
         }
         Err(_) => "target gone, will be pruned on next gc".to_string(),
     }
+}
+
+// ---------- color ----------
+// Hand-rolled ANSI helpers (no extra crate) — auto-disabled when stdout isn't
+// a terminal, so piping to a file or log doesn't fill up with escape codes.
+
+fn use_color() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+fn col(code: &str) -> String {
+    if use_color() {
+        format!("\x1b[{code}m")
+    } else {
+        String::new()
+    }
+}
+
+fn reset() -> String {
+    col("0")
+}
+fn bold() -> String {
+    col("1")
+}
+fn dim() -> String {
+    col("2")
+}
+fn red() -> String {
+    col("31")
+}
+fn green() -> String {
+    col("32")
+}
+fn yellow() -> String {
+    col("33")
+}
+fn cyan() -> String {
+    col("36")
 }
