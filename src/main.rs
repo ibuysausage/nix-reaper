@@ -9,13 +9,7 @@ use std::thread;
 use std::time::SystemTime;
 
 #[derive(Parser)]
-#[command(
-    name = "nix-reaper",
-    version,
-    about = "Deep-clean a NixOS system: generations, boot entries, GC roots, non-Nix bloat, \
-             dev-tool caches, coredumps — ALL of it. `clean` keeps nothing old around. \
-             There is no --keep-last-N. If it's not your current generation, it's gone."
-)]
+#[command(name = "nix-reaper", version, about = "Deep-clean a NixOS system")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
