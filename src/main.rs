@@ -9,7 +9,7 @@ use std::thread;
 use std::time::SystemTime;
 
 #[derive(Parser)]
-#[command(name = "nix-reaper", version, about = "Deep-clean a NixOS system")]
+#[command(name = "nix-reaper", version, about = "Fully-clean a NixOS system")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
