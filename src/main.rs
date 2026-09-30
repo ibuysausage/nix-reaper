@@ -181,9 +181,7 @@ fn status() -> Result<()> {
     }
 
     println!();
-    println!(
-        "Run `nix-reaper clean --dry-run` to preview the full nuke, or `nix-reaper clean` to just do it."
-    );
+    println!("Run `nix-reaper clean --dry-run` to preview, or `nix-reaper clean` to just do it.");
     Ok(())
 }
 
